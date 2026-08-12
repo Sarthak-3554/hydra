@@ -12,7 +12,12 @@ using namespace std;
 #define REQUEST_PIECE 1
 #define SEND_PIECE    2
 #define HAVE_UPDATE   3
+#define FAILURE_DETECTED 4     // gossip: "peer X is unreachable, stop counting on it"
+#define HEARTBEAT     5        // periodic "I'm still alive" ping
 #define REPLICATION_FACTOR 3   // target number of copies per piece
+#define REQUEST_TIMEOUT_ITERS 50   // loops to wait for a direct reply before suspecting the source
+#define HEARTBEAT_TIMEOUT_ITERS 100 // loops without ANY heartbeat before declaring a peer dead
+#define FAIL_AFTER_PIECES 3       // simulated-failure rank goes silent after holding this many
 
 struct Piece {
     int  id;
@@ -68,6 +73,53 @@ void drain_have_updates(vector<vector<int>>& peer_have) {
     }
 }
 
+// ── Tell all peers "rank X is unreachable" so everyone's view converges ───
+void announce_failure(int dead_rank, int rank, int size) {
+    for (int p = 0; p < size; p++) {
+        if (p == rank) continue;
+        MPI_Send(&dead_rank, 1, MPI_INT, p, FAILURE_DETECTED, MPI_COMM_WORLD);
+    }
+}
+
+// ── Read all waiting FAILURE_DETECTED messages ────────────────────────────
+void drain_failure_updates(vector<int>& alive) {
+    while (true) {
+        MPI_Status status;
+        int flag = 0;
+        MPI_Iprobe(MPI_ANY_SOURCE, FAILURE_DETECTED, MPI_COMM_WORLD, &flag, &status);
+        if (!flag) break;
+        int dead_rank;
+        MPI_Recv(&dead_rank, 1, MPI_INT,
+                 status.MPI_SOURCE, FAILURE_DETECTED, MPI_COMM_WORLD, &status);
+        alive[dead_rank] = 0;
+    }
+}
+
+// ── Periodic "I'm still alive" ping — this is what makes failure detection
+// work regardless of whether anyone happens to be transferring data with
+// the failed peer at the time. Same idea as a gossip/heartbeat protocol in
+// a real distributed system (e.g. Cassandra's failure detector).
+void broadcast_heartbeat(int rank, int size) {
+    for (int p = 0; p < size; p++) {
+        if (p == rank) continue;
+        MPI_Send(&rank, 1, MPI_INT, p, HEARTBEAT, MPI_COMM_WORLD);
+    }
+}
+
+// ── Read all waiting heartbeats, recording when we last heard from each peer
+void drain_heartbeats(vector<int>& last_heartbeat_iter, int current_iter) {
+    while (true) {
+        MPI_Status status;
+        int flag = 0;
+        MPI_Iprobe(MPI_ANY_SOURCE, HEARTBEAT, MPI_COMM_WORLD, &flag, &status);
+        if (!flag) break;
+        int sender;
+        MPI_Recv(&sender, 1, MPI_INT,
+                 status.MPI_SOURCE, HEARTBEAT, MPI_COMM_WORLD, &status);
+        last_heartbeat_iter[sender] = current_iter;
+    }
+}
+
 // ── Serve all waiting piece requests ──────────────────────────────────────
 void serve_pending_requests(vector<Piece>& pieces, int rank) {
     while (true) {
@@ -101,42 +153,46 @@ void serve_pending_requests(vector<Piece>& pieces, int rank) {
     }
 }
 
-// ── Pick best peer to ask (prefer non-seeder to spread load) ──────────────
+// ── Pick best peer to ask (prefer non-seeder to spread load), skipping
+//    any peer we already believe is dead ────────────────────────────────
 int pick_peer(int piece_id, int my_rank, int size,
-              vector<vector<int>>& peer_have) {
+              vector<vector<int>>& peer_have, vector<int>& alive) {
     for (int p = 1; p < size; p++) {
         if (p == my_rank) continue;
+        if (!alive[p]) continue;
         if (peer_have[p][piece_id]) return p;
     }
-    if (peer_have[0][piece_id]) return 0;
+    if (alive[0] && peer_have[0][piece_id]) return 0;
     return -1;
 }
 
-// ── How many peers (by our current local knowledge) hold this piece ───────
-int replica_count(int piece_id, int size, vector<vector<int>>& peer_have) {
+// ── How many still-ALIVE peers (by our current local knowledge) hold this
+//    piece. A copy sitting on a dead node no longer counts — it can't be
+//    served, so from the swarm's perspective it isn't really "replicated."
+int replica_count(int piece_id, int size, vector<vector<int>>& peer_have, vector<int>& alive) {
     int count = 0;
     for (int p = 0; p < size; p++)
-        if (peer_have[p][piece_id]) count++;
+        if (alive[p] && peer_have[p][piece_id]) count++;
     return count;
 }
 
-// ── Deterministic piece ownership — the real fix for the race condition.
-// Instead of nodes RACING to decide who fetches an under-replicated piece
-// (which a claim-broadcast can only ever reduce, never eliminate, under
-// real concurrency), every node runs the SAME formula and independently
-// arrives at the SAME answer for "who owns this piece" — with zero
-// messages exchanged. There is nothing left to race over.
-//
-// Rank 0 (seeder) already holds everything and counts as 1 of the K copies.
-// The remaining (K-1) copies are assigned to leechers by rotating through
-// them based on piece id, so ownership spreads evenly instead of piling
-// onto the first few ranks.
-bool is_assigned_owner(int piece_id, int rank, int size, int K) {
-    if (rank == 0) return false;              // seeder doesn't "fetch"
-    int num_leechers = size - 1;               // ranks 1..size-1
-    int needed = min(K - 1, num_leechers);      // copies needed beyond the seeder
+// ── Deterministic piece ownership, recomputed over only the currently-alive
+// leechers. When a leecher is marked dead, it drops out of everyone's
+// rotation calculation identically (same gossip, same formula) — so its
+// ownership responsibilities are automatically picked up by the remaining
+// alive leechers, with no coordinator and no extra messages needed.
+bool is_assigned_owner(int piece_id, int rank, int size, int K, vector<int>& alive) {
+    if (rank == 0) return false;                 // seeder doesn't "fetch"
+    if (!alive[rank]) return false;               // dead nodes don't act
+
+    vector<int> alive_leechers;
+    for (int p = 1; p < size; p++)
+        if (alive[p]) alive_leechers.push_back(p);
+    if (alive_leechers.empty()) return false;
+
+    int needed = min(K - 1, (int)alive_leechers.size());
     for (int i = 0; i < needed; i++) {
-        int owner = 1 + ((piece_id + i) % num_leechers);
+        int owner = alive_leechers[(piece_id + i) % alive_leechers.size()];
         if (owner == rank) return true;
     }
     return false;
@@ -153,9 +209,16 @@ int main(int argc, char** argv) {
         MPI_Finalize(); return 1;
     }
 
+    // Optional: ./mpi_torrent <fail_rank>  — that rank simulates a crash
+    // partway through by going silent (stops serving + stops fetching).
+    int fail_rank = (argc > 1) ? atoi(argv[1]) : -1;
+    bool i_have_failed = false;
+
     vector<Piece>       pieces;
     vector<int>         have(MAX_PIECES, 0);
     vector<vector<int>> peer_have(size, vector<int>(MAX_PIECES, 0));
+    vector<int>         alive(size, 1);   // local, gossip-updated view of who's reachable
+    vector<int>         last_heartbeat_iter(size, 0);  // loop_counter when we last heard from each peer
     int total_pieces = 0;
 
     // Rank 0 = seeder
@@ -189,12 +252,25 @@ int main(int argc, char** argv) {
              << " (requested " << REPLICATION_FACTOR << ", capped by " << size
              << " nodes)\n";
 
-    // Non-blocking recv state
+    // Non-blocking recv state. recv_buf is allocated fresh per request
+    // (never reused) so a timed-out request can be safely abandoned —
+    // MPI_Cancel on a large in-flight receive is unreliable in practice
+    // (it can't stop a sender mid-rendezvous-handshake for that transfer),
+    // so instead of fighting that, we just orphan the old buffer/request
+    // and let the next request use entirely fresh memory. The process
+    // exits soon after anyway, so the leaked handle is harmless here.
     bool        waiting_for_piece = false;
     int         waiting_for_id    = -1;
     int         waiting_from_peer = -1;
+    int         wait_iters        = 0;
     MPI_Request pending_recv      = MPI_REQUEST_NULL;
-    Piece       recv_buf;
+    Piece*      recv_buf          = nullptr;
+
+    // Recovery-time metric: rank 0 times the gap between first learning of
+    // a failure and the swarm restoring full replication afterward — this
+    // is the number worth putting on a resume ("recovered in X seconds").
+    double failure_detected_time = -1;
+    bool   recovery_timer_running = false;
 
     // ── MAIN LOOP ──────────────────────────────────────────────────────────
     // Termination: every N iterations we do an MPI_Allreduce to check
@@ -204,11 +280,40 @@ int main(int argc, char** argv) {
 
     while (true) {
 
-        // Step 1: refresh who-has-what
+        // Step 1: refresh who-has-what, and who's-unreachable
         drain_have_updates(peer_have);
+        drain_failure_updates(alive);
+        drain_heartbeats(last_heartbeat_iter, loop_counter);
+        if (!i_have_failed) broadcast_heartbeat(rank, size);   // a failed node stops pinging
 
-        // Step 2: serve anyone requesting pieces from us
-        serve_pending_requests(pieces, rank);
+        // Step 1b: anyone we haven't heard a heartbeat from in too long is
+        // presumed dead — this is what catches the case where nobody
+        // happens to be actively fetching FROM the failed peer, so a
+        // request-timeout would never fire on its own.
+        for (int p = 0; p < size; p++) {
+            if (p == rank || !alive[p]) continue;
+            if (loop_counter - last_heartbeat_iter[p] > HEARTBEAT_TIMEOUT_ITERS) {
+                cout << "[Peer " << rank << "] No heartbeat from peer " << p
+                     << " in " << HEARTBEAT_TIMEOUT_ITERS << " loops — marking it unreachable\n";
+                alive[p] = 0;
+                announce_failure(p, rank, size);
+            }
+        }
+
+        // Simulated failure trigger: once this rank has done a bit of real
+        // work (so the demo shows partial replication before it happens),
+        // it goes silent — stops serving and stops fetching. It still has
+        // to call the MPI collectives below so the rest of the job doesn't
+        // hang (vanilla MPI has no built-in fault tolerance — a real
+        // process crash brings down the whole run, not just that rank).
+        if (rank == fail_rank && !i_have_failed && (int)pieces.size() >= FAIL_AFTER_PIECES) {
+            i_have_failed = true;
+            cout << "\n[Peer " << rank << "] *** SIMULATING FAILURE — going silent now ***\n\n";
+        }
+
+        // Step 2: serve anyone requesting pieces from us (skip if we've failed)
+        if (!i_have_failed)
+            serve_pending_requests(pieces, rank);
 
         // Step 3: check if our pending non-blocking recv completed
         if (waiting_for_piece) {
@@ -216,9 +321,10 @@ int main(int argc, char** argv) {
             MPI_Status status;
             MPI_Test(&pending_recv, &flag, &status);
             if (flag) {
+                wait_iters = 0;
                 waiting_for_piece = false;
-                if (recv_buf.actual_size > 0) {
-                    pieces.push_back(recv_buf);
+                if (recv_buf->actual_size > 0) {
+                    pieces.push_back(*recv_buf);
                     have[waiting_for_id]            = 1;
                     peer_have[rank][waiting_for_id] = 1;
                     cout << "[Peer " << rank << "] Got piece " << waiting_for_id
@@ -228,32 +334,55 @@ int main(int argc, char** argv) {
                     // Peer didn't have it — clear and retry from someone else
                     peer_have[waiting_from_peer][waiting_for_id] = 0;
                 }
+                delete recv_buf;
+                recv_buf = nullptr;
                 waiting_for_id    = -1;
                 waiting_from_peer = -1;
+            } else {
+                // No reply yet — count how long we've been waiting. If it's
+                // gone on too long, the source is unreachable: treat it as
+                // a failure and tell everyone. We deliberately do NOT call
+                // MPI_Cancel here (unreliable for large in-flight receives
+                // in practice) — we just abandon this buffer/request and
+                // move on with a completely fresh one next time.
+                wait_iters++;
+                if (wait_iters > REQUEST_TIMEOUT_ITERS) {
+                    cout << "[Peer " << rank << "] Timeout waiting on peer "
+                         << waiting_from_peer << " for piece " << waiting_for_id
+                         << " — marking it unreachable\n";
+                    alive[waiting_from_peer] = 0;
+                    announce_failure(waiting_from_peer, rank, size);
+                    waiting_for_piece = false;   // recv_buf/pending_recv deliberately abandoned, not freed
+                    waiting_for_id    = -1;
+                    waiting_from_peer = -1;
+                    wait_iters        = 0;
+                }
             }
         }
 
         // Step 4: fetch the next piece I'm deterministically assigned to own,
-        // that I don't hold yet. No claim/race needed at all — every node
-        // computes the same ownership answer independently, so two nodes
-        // can never both decide to fetch the same piece by coincidence.
-        if (!waiting_for_piece && rank != 0) {
+        // that I don't hold yet — recomputed over currently-alive nodes, so
+        // if my assignment shifted because someone else died, I pick that up
+        // automatically. A failed rank does none of this — it's gone silent.
+        if (!waiting_for_piece && rank != 0 && !i_have_failed) {
             for (int pid = 0; pid < total_pieces; pid++) {
                 if (have[pid]) continue;
-                if (!is_assigned_owner(pid, rank, size, K)) continue;
-                int source = pick_peer(pid, rank, size, peer_have);
-                if (source == -1) continue;   // nobody has announced it yet, try again next loop
+                if (!is_assigned_owner(pid, rank, size, K, alive)) continue;
+                int source = pick_peer(pid, rank, size, peer_have, alive);
+                if (source == -1) continue;   // nobody alive has announced it yet, try again next loop
 
                 cout << "[Peer " << rank << "] Fetching assigned piece " << pid
                      << " from peer " << source << "\n";
 
                 MPI_Send(&pid, 1, MPI_INT, source, REQUEST_PIECE, MPI_COMM_WORLD);
-                MPI_Irecv(&recv_buf, sizeof(Piece), MPI_BYTE,
+                recv_buf = new Piece();
+                MPI_Irecv(recv_buf, sizeof(Piece), MPI_BYTE,
                           source, SEND_PIECE, MPI_COMM_WORLD, &pending_recv);
 
                 waiting_for_piece = true;
                 waiting_for_id    = pid;
                 waiting_from_peer = source;
+                wait_iters        = 0;
                 break;
             }
         }
@@ -270,13 +399,28 @@ int main(int argc, char** argv) {
         // sync cost slowing down the actual transfers.
         loop_counter++;
         if (loop_counter % 10 == 0) {
-            // Am I done? Under replication, "done" means every piece has
-            // reached the target K copies — by MY current knowledge of
-            // peer_have. Once HAVE_UPDATE broadcasts finish propagating,
-            // every rank's local view converges and the Allreduce agrees.
+            // Rank 0 starts the recovery clock the first time it locally
+            // learns the simulated-failure rank is down (via gossip) —
+            // this timestamps when the swarm becomes aware it has damage
+            // to repair, not when the failure itself was injected.
+            if (rank == 0 && fail_rank != -1 && !alive[fail_rank] && !recovery_timer_running) {
+                failure_detected_time = MPI_Wtime();
+                recovery_timer_running = true;
+                cout << "[Seeder] Detected peer " << fail_rank
+                     << " is unreachable — recovery clock started\n";
+            }
+
+            // Am I done? "Done" now means every piece has reached the
+            // target among currently-ALIVE nodes — if enough nodes have
+            // died that K copies is no longer achievable, the target caps
+            // down instead of waiting forever for something impossible.
+            int num_alive_leechers = 0;
+            for (int p = 1; p < size; p++) if (alive[p]) num_alive_leechers++;
+            int required = min(K, 1 + num_alive_leechers);
+
             int i_am_done = 1;
             for (int pid = 0; pid < total_pieces; pid++) {
-                if (replica_count(pid, size, peer_have) < K) { i_am_done = 0; break; }
+                if (replica_count(pid, size, peer_have, alive) < required) { i_am_done = 0; break; }
             }
 
             int everyone_done = 0;
@@ -289,16 +433,18 @@ int main(int argc, char** argv) {
 
             if (everyone_done) {
                 cout << "[Peer " << rank << "] All peers done, exiting.\n";
+                if (rank == 0 && recovery_timer_running) {
+                    double recovery_seconds = MPI_Wtime() - failure_detected_time;
+                    cout << "\n[Recovery] Full replication restored "
+                         << recovery_seconds << " seconds after failure was detected.\n";
+                }
                 break; // everyone exits the loop at the same time
             }
         }
     }
 
-    // Cancel any leftover pending recv
-    if (waiting_for_piece) {
-        MPI_Cancel(&pending_recv);
-        MPI_Request_free(&pending_recv);
-    }
+    // Any abandoned (timed-out) receive is deliberately left alone here —
+    // see the note in Step 3 on why we don't attempt to cancel it.
 
     MPI_Barrier(MPI_COMM_WORLD);
 
@@ -307,8 +453,9 @@ int main(int argc, char** argv) {
     if (rank != 0 && !pieces.empty()) {
         string filename = "output_peer_" + to_string(rank) + ".bin";
         write_file(pieces, filename.c_str());
+        string status = i_have_failed ? " [FAILED — stale data, excluded from swarm]" : "";
         cout << "[Peer " << rank << "] Wrote " << filename
-             << " (" << pieces.size() << "/" << total_pieces << " pieces held)\n";
+             << " (" << pieces.size() << "/" << total_pieces << " pieces held)" << status << "\n";
     }
 
     // Rank 0 prints a final replication report — this is the number worth
@@ -317,7 +464,7 @@ int main(int argc, char** argv) {
         int min_replicas = INT_MAX, max_replicas = 0;
         int sum_replicas = 0, exactly_at_K = 0, over_K = 0;
         for (int pid = 0; pid < total_pieces; pid++) {
-            int rc = replica_count(pid, size, peer_have);
+            int rc = replica_count(pid, size, peer_have, alive);
             min_replicas = min(min_replicas, rc);
             max_replicas = max(max_replicas, rc);
             sum_replicas += rc;
@@ -331,7 +478,10 @@ int main(int argc, char** argv) {
              << " | Avg=" << avg
              << " | Exactly at K=" << exactly_at_K << "/" << total_pieces
              << " | Over-replicated=" << over_K << "/" << total_pieces
-             << " | " << (min_replicas >= K ? "TARGET MET" : "UNDER-REPLICATED") << "\n";
+             << " | " << (min_replicas >= min(K, size) ? "TARGET MET" : "UNDER-REPLICATED") << "\n";
+        if (fail_rank != -1)
+            cout << "[Replication Report] Simulated failure of peer " << fail_rank
+                 << " — its data excluded from the counts above (correctly treated as unreachable)\n";
     }
 
     MPI_Finalize();
